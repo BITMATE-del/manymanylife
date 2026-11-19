@@ -201,9 +201,17 @@ async def send(body,images,target_chat=None):
             for f in streams:f.close()
     if len(body)>1024:await telegram("sendMessage",{"chat_id":GROUP,"text":body})
 async def chat(opened):
+    target=group_id()
+    if not target:raise RuntimeError("운영 그룹을 먼저 선택해 주세요")
+    member=await telegram("getChatMember",{"chat_id":target,"user_id":(await telegram("getMe"))["id"]})
+    if member.get("status")!="administrator" and member.get("status")!="creator":
+        raise RuntimeError("그룹에서 봇을 관리자로 추가해 주세요")
+    if member.get("status")=="administrator" and not member.get("can_restrict_members",False):
+        raise RuntimeError("그룹 관리자의 '멤버 제한' 권한을 봇에 허용해 주세요")
     permissions={k:opened for k in ("can_send_messages","can_send_audios","can_send_documents","can_send_photos","can_send_videos","can_send_video_notes","can_send_voice_notes","can_send_polls","can_send_other_messages","can_add_web_page_previews")}
     permissions["can_invite_users"]=True
-    await telegram("setChatPermissions",{"chat_id":GROUP,"permissions":permissions,"use_independent_chat_permissions":True})
+    await telegram("setChatPermissions",{"chat_id":target,"permissions":permissions,"use_independent_chat_permissions":True})
+    log(("채팅 열기" if opened else "채팅 잠금")+" 성공: "+str(target))
 async def execute(s):
     if s["action"]=="open":await chat(True)
     await send(s["body"],s["images"])
