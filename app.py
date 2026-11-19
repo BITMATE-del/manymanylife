@@ -29,11 +29,22 @@ def db():
     c.row_factory=sqlite3.Row
     return c
 def now(): return datetime.now(TZ)
+def group_id():
+    with db() as c:
+        r=c.execute("SELECT chat_id FROM groups WHERE active=1 ORDER BY rowid LIMIT 1").fetchone()
+        return r["chat_id"] if r else GROUP
+def track_group(chat):
+    ident=str(chat.get("id",""))
+    if not ident or chat.get("type") not in ("group","supergroup"):return
+    title=str(chat.get("title") or ident)[:200]
+    with db() as c:
+        c.execute("INSERT INTO groups(chat_id,title,active) VALUES(?,?,1) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,active=1",(ident,title))
 def initialize():
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS schedule(id TEXT PRIMARY KEY,title TEXT NOT NULL,time TEXT NOT NULL,end_time TEXT,interval INTEGER,days TEXT NOT NULL,body TEXT NOT NULL,images TEXT NOT NULL,action TEXT NOT NULL,active INTEGER NOT NULL,priority INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS groups(chat_id TEXT PRIMARY KEY,title TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS runs(id TEXT NOT NULL,minute TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(id,minute));
         CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,detail TEXT NOT NULL);
@@ -76,7 +87,7 @@ def save(s,ident):
 @app.get("/",response_class=HTMLResponse,dependencies=[Depends(guard)])
 def home():return (ROOT/"index.html").read_text(encoding="utf-8")
 @app.get("/health")
-def health():return {"ok":True,"configured":bool(TOKEN and GROUP)}
+def health():return {"ok":True,"configured":bool(TOKEN and group_id())}
 @app.get("/api/state",dependencies=[Depends(guard)])
 def state():
     with db() as c:
@@ -84,7 +95,13 @@ def state():
         "media":[dict(x) for x in c.execute("SELECT id,name FROM media")],
         "welcome":json.loads(c.execute("SELECT value FROM settings WHERE key='welcome'").fetchone()["value"]),
         "logs":[dict(x) for x in c.execute("SELECT at,detail FROM logs ORDER BY id DESC LIMIT 30")],
-        "configured":bool(TOKEN and GROUP)}
+        "configured":bool(TOKEN and group_id()),"groups":[dict(x) for x in c.execute("SELECT chat_id,title,active FROM groups ORDER BY title")],"selected_group":group_id()}
+@app.put("/api/group/{ident}",dependencies=[Depends(guard)])
+def choose_group(ident:str):
+    with db() as c:
+        if not c.execute("SELECT 1 FROM groups WHERE chat_id=? AND active=1",(ident,)).fetchone():raise HTTPException(404,"등록된 그룹이 아닙니다")
+        c.execute("UPDATE groups SET active=CASE WHEN chat_id=? THEN 1 ELSE 0 END",(ident,))
+    return {"ok":True}
 @app.post("/api/schedule",dependencies=[Depends(guard)])
 def create(s:Schedule):return save(s,uuid.uuid4().hex)
 @app.put("/api/schedule/{ident}",dependencies=[Depends(guard)])
@@ -145,13 +162,13 @@ async def telegram(method,payload=None,files=None):
         return j["result"]
 async def send(body,images):
     if not images:
-        if body.strip():await telegram("sendMessage",{"chat_id":GROUP,"text":body})
+        if body.strip():await telegram("sendMessage",{"chat_id":group_id(),"text":body})
         return
     if len(images)==1:
         with db() as c:r=c.execute("SELECT path FROM media WHERE id=?",(images[0],)).fetchone()
         if not r:raise RuntimeError("첨부 이미지 누락")
         path=Path(r["path"])
-        with path.open("rb") as f:await telegram("sendPhoto",{"chat_id":GROUP,"caption":body[:1024]},{"photo":(path.name,f,"image/jpeg" if path.suffix==".jpg" else "image/png" if path.suffix==".png" else "image/webp")})
+        with path.open("rb") as f:await telegram("sendPhoto",{"chat_id":group_id(),"caption":body[:1024]},{"photo":(path.name,f,"image/jpeg" if path.suffix==".jpg" else "image/png" if path.suffix==".png" else "image/webp")})
     else:
         streams=[]
         try:
@@ -195,7 +212,7 @@ def due(s,t):
 async def clock():
     while True:
         try:
-            if TOKEN and GROUP:
+            if TOKEN and group_id():
                 t=now(); key=t.strftime("%Y-%m-%dT%H:%M")
                 with db() as c:items=[readable(r) for r in c.execute("SELECT * FROM schedule WHERE active=1 ORDER BY priority,time")]
                 for s in items:
@@ -215,14 +232,22 @@ async def poll():
     offset=None
     while True:
         try:
-            if not TOKEN or not GROUP:
+            if not TOKEN:
                 await asyncio.sleep(10);continue
-            p={"timeout":25,"allowed_updates":["message"]}
+            p={"timeout":25,"allowed_updates":["message","my_chat_member"]}
             if offset is not None:p["offset"]=offset
             for u in await telegram("getUpdates",p):
                 offset=u["update_id"]+1
+                evt=u.get("my_chat_member",{})
+                if evt:
+                    chat=evt.get("chat",{})
+                    status=evt.get("new_chat_member",{}).get("status","")
+                    if status in ("member","administrator"):track_group(chat)
+                    elif status in ("left","kicked"):
+                        with db() as c:c.execute("UPDATE groups SET active=0 WHERE chat_id=?",(str(chat.get("id")),))
                 msg=u.get("message",{})
-                if str(msg.get("chat",{}).get("id"))!=GROUP:continue
+                if msg.get("chat",{}).get("type") in ("group","supergroup"):track_group(msg["chat"])
+                if str(msg.get("chat",{}).get("id"))!=group_id():continue
                 members=msg.get("new_chat_members",[])
                 if not members:continue
                 with db() as c:cfg=json.loads(c.execute("SELECT value FROM settings WHERE key='welcome'").fetchone()["value"])
@@ -237,6 +262,8 @@ async def poll():
 @app.on_event("startup")
 async def start():
     initialize()
+    if GROUP:
+        with db() as c:c.execute("INSERT OR IGNORE INTO groups(chat_id,title,active) VALUES(?,?,1)",(GROUP,"기본 그룹",1))
     app.state.tasks=[asyncio.create_task(clock()),asyncio.create_task(poll())]
 @app.on_event("shutdown")
 async def stop():
