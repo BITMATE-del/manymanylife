@@ -51,6 +51,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS runs(id TEXT NOT NULL,minute TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(id,minute));
         CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,detail TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS recent_welcome(chat_id TEXT NOT NULL,user_id TEXT NOT NULL,seen_at INTEGER NOT NULL,PRIMARY KEY(chat_id,user_id));
         """)
         if not c.execute("SELECT 1 FROM settings WHERE key='init'").fetchone():
             items=[("08:55","보이스룸 1차","send",100),("09:00","채팅 열기","open",10),("14:00","휴식 안내","send",100),("15:00","휴식 안내","send",100),("16:00","휴식 안내","send",100),("17:55","보이스룸 2차","send",100),("20:00","마감 안내","send_close",200)]
@@ -256,6 +257,15 @@ async def send_welcome(chat,user):
         row=c.execute("SELECT value FROM settings WHERE key='welcome'").fetchone()
         cfg=json.loads(row["value"]) if row else {"active":False}
     if not cfg.get("active",False):return
+    import time
+    stamp=int(time.time())
+    chat_key=str(chat["id"]);member_key=str(user.get("id",""))
+    if member_key:
+        with db() as c:
+            prior=c.execute("SELECT seen_at FROM recent_welcome WHERE chat_id=? AND user_id=?",(chat_key,member_key)).fetchone()
+            if prior and stamp-prior["seen_at"]<60:return
+            c.execute("INSERT OR REPLACE INTO recent_welcome(chat_id,user_id,seen_at) VALUES(?,?,?)",(chat_key,member_key,stamp))
+            c.execute("DELETE FROM recent_welcome WHERE seen_at < ?",(stamp-86400,))
     name=nickname_for(user)
     body=cfg.get("body","{nickname}님 반갑습니다.").replace("{nickname}",name)
     await send(body,cfg.get("images",[]),target_chat=str(chat["id"]))
