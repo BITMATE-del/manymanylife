@@ -31,6 +31,8 @@ def db():
 def now(): return datetime.now(TZ)
 def group_id():
     with db() as c:
+        v=c.execute("SELECT value FROM settings WHERE key='selected_group'").fetchone()
+        if v and c.execute("SELECT 1 FROM groups WHERE chat_id=? AND active=1",(v["value"],)).fetchone():return v["value"]
         r=c.execute("SELECT chat_id FROM groups WHERE active=1 ORDER BY rowid LIMIT 1").fetchone()
         return r["chat_id"] if r else GROUP
 def track_group(chat):
@@ -100,7 +102,7 @@ def state():
 def choose_group(ident:str):
     with db() as c:
         if not c.execute("SELECT 1 FROM groups WHERE chat_id=? AND active=1",(ident,)).fetchone():raise HTTPException(404,"등록된 그룹이 아닙니다")
-        c.execute("UPDATE groups SET active=CASE WHEN chat_id=? THEN 1 ELSE 0 END",(ident,))
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('selected_group',?)",(ident,))
     return {"ok":True}
 @app.post("/api/schedule",dependencies=[Depends(guard)])
 def create(s:Schedule):return save(s,uuid.uuid4().hex)
