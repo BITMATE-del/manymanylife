@@ -35,6 +35,18 @@ def group_id():
         if v and c.execute("SELECT 1 FROM groups WHERE chat_id=? AND active=1",(v["value"],)).fetchone():return v["value"]
         r=c.execute("SELECT chat_id FROM groups WHERE active=1 ORDER BY rowid LIMIT 1").fetchone()
         return r["chat_id"] if r else GROUP
+def migrate_group(old_id,new_id,title=None):
+    old_id=str(old_id);new_id=str(new_id)
+    if not old_id or not new_id or old_id==new_id:return
+    with db() as c:
+        previous=c.execute("SELECT title FROM groups WHERE chat_id=?",(old_id,)).fetchone()
+        label=str(title or (previous["title"] if previous else new_id))[:200]
+        c.execute("INSERT INTO groups(chat_id,title,active) VALUES(?,?,1) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, active=1",(new_id,label))
+        c.execute("UPDATE groups SET active=0 WHERE chat_id=?",(old_id,))
+        selected=c.execute("SELECT value FROM settings WHERE key='selected_group'").fetchone()
+        if selected and selected["value"]==old_id:
+            c.execute("UPDATE settings SET value=? WHERE key='selected_group'",(new_id,))
+    log("슈퍼그룹 자동 전환: "+old_id+" → "+new_id)
 def track_group(chat):
     ident=str(chat.get("id",""))
     if not ident or chat.get("type") not in ("group","supergroup"):return
@@ -165,11 +177,24 @@ def welcome(w:Welcome):
 async def telegram(method,payload=None,files=None):
     if not TOKEN:raise RuntimeError("BOT_TOKEN 미설정")
     async with httpx.AsyncClient(timeout=35) as client:
-        if files:r=await client.post("https://api.telegram.org/bot"+TOKEN+"/"+method,data=payload,files=files)
-        else:r=await client.post("https://api.telegram.org/bot"+TOKEN+"/"+method,json=payload or {})
-        j=r.json()
-        if not j.get("ok"):raise RuntimeError(str(j.get("description",r.status_code)))
-        return j["result"]
+        for attempt in range(2):
+            if files:
+                if attempt:
+                    for part in files.values():
+                        stream=part[1]
+                        if hasattr(stream,"seek"):stream.seek(0)
+                r=await client.post("https://api.telegram.org/bot"+TOKEN+"/"+method,data=payload,files=files)
+            else:
+                r=await client.post("https://api.telegram.org/bot"+TOKEN+"/"+method,json=payload or {})
+            j=r.json()
+            if j.get("ok"):return j["result"]
+            old_id=(payload or {}).get("chat_id")
+            new_id=(j.get("parameters") or {}).get("migrate_to_chat_id")
+            if old_id is not None and new_id is not None and attempt==0:
+                migrate_group(old_id,new_id)
+                payload={**payload,"chat_id":new_id}
+                continue
+            raise RuntimeError(str(j.get("description",r.status_code)))
 async def send(body,images,target_chat=None):
     recipient=target_chat or group_id()
     if not recipient:raise RuntimeError("운영 그룹을 선택해 주세요")
@@ -180,7 +205,7 @@ async def send(body,images,target_chat=None):
         with db() as c:r=c.execute("SELECT path FROM media WHERE id=?",(images[0],)).fetchone()
         if not r:raise RuntimeError("첨부 이미지 누락")
         path=Path(r["path"])
-        with path.open("rb") as f:await telegram("sendPhoto",{"chat_id":group_id(),"caption":body[:1024]},{"photo":(path.name,f,"image/jpeg" if path.suffix==".jpg" else "image/png" if path.suffix==".png" else "image/webp")})
+        with path.open("rb") as f:await telegram("sendPhoto",{"chat_id":recipient,"caption":body[:1024]},{"photo":(path.name,f,"image/jpeg" if path.suffix==".jpg" else "image/png" if path.suffix==".png" else "image/webp")})
     else:
         streams=[]
         try:
@@ -199,7 +224,7 @@ async def send(body,images,target_chat=None):
             await telegram("sendMediaGroup",{"chat_id":recipient,"media":json.dumps(album,ensure_ascii=False)},files)
         finally:
             for f in streams:f.close()
-    if len(body)>1024:await telegram("sendMessage",{"chat_id":GROUP,"text":body})
+    if len(body)>1024:await telegram("sendMessage",{"chat_id":recipient,"text":body})
 async def chat(opened):
     target=group_id()
     if not target:raise RuntimeError("운영 그룹을 먼저 선택해 주세요")
@@ -299,6 +324,10 @@ async def handle_update(u):
     if msg and msg.get("chat",{}).get("type") in ("group","supergroup"):
         chat=msg["chat"]
         track_group(chat)
+        if msg.get("migrate_to_chat_id"):
+            migrate_group(chat["id"],msg["migrate_to_chat_id"],chat.get("title"))
+        if msg.get("migrate_from_chat_id"):
+            migrate_group(msg["migrate_from_chat_id"],chat["id"],chat.get("title"))
         # Telegram may deliver both message and chat_member for one join.
         # A short-lived dedupe token in SQLite avoids two welcomes for the same member.
         for member in msg.get("new_chat_members",[]):
