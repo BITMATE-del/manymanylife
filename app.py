@@ -50,14 +50,21 @@ def initialize():
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS runs(id TEXT NOT NULL,minute TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(id,minute));
         CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,detail TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY);
         """)
         if not c.execute("SELECT 1 FROM settings WHERE key='init'").fetchone():
             items=[("08:55","보이스룸 1차","send",100),("09:00","채팅 열기","open",10),("14:00","휴식 안내","send",100),("15:00","휴식 안내","send",100),("16:00","휴식 안내","send",100),("17:55","보이스룸 2차","send",100),("20:00","마감 안내","send_close",200)]
             for t,title,action,priority in items:
                 c.execute("INSERT INTO schedule VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uuid.uuid4().hex,title,t,None,None,json.dumps(list(range(7))),"", "[]",action,1,priority))
             c.execute("INSERT INTO schedule VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uuid.uuid4().hex,"매시간 정기 공지","09:00","20:00",60,json.dumps(list(range(7))),"","[]","send",1,100))
-            c.execute("INSERT INTO settings VALUES('welcome',?)",(json.dumps({"active":True,"body":"텔닉({nickname})님 반갑습니다.","images":[]},ensure_ascii=False),))
+            c.execute("INSERT INTO settings VALUES('welcome',?)",(json.dumps({"active":True,"body":"{nickname}님 반갑습니다.","images":[]},ensure_ascii=False),))
             c.execute("INSERT INTO settings VALUES('init','1')")
+        old=c.execute("SELECT value FROM settings WHERE key='welcome'").fetchone()
+        if old:
+            w=json.loads(old["value"])
+            if w.get("body")=="텔닉({nickname})님 반갑습니다.":
+                w["body"]="{nickname}님 반갑습니다."
+                c.execute("UPDATE settings SET value=? WHERE key='welcome'",(json.dumps(w,ensure_ascii=False),))
 def log(s):
     with db() as c:c.execute("INSERT INTO logs(at,detail) VALUES(?,?)",(now().isoformat(timespec="seconds"),str(s)[:400]))
 def readable(row):
@@ -144,7 +151,7 @@ def delete_media(ident:str):
     return {"ok":True}
 class Welcome(BaseModel):
     active:bool=True
-    body:str=Field(default="텔닉({nickname})님 반갑습니다.",max_length=4096)
+    body:str=Field(default="{nickname}님 반갑습니다.",max_length=4096)
     images:list[str]=Field(default_factory=list,max_length=10)
 @app.put("/api/welcome",dependencies=[Depends(guard)])
 def welcome(w:Welcome):
@@ -162,9 +169,11 @@ async def telegram(method,payload=None,files=None):
         j=r.json()
         if not j.get("ok"):raise RuntimeError(str(j.get("description",r.status_code)))
         return j["result"]
-async def send(body,images):
+async def send(body,images,target_chat=None):
+    recipient=target_chat or group_id()
+    if not recipient:raise RuntimeError("운영 그룹을 선택해 주세요")
     if not images:
-        if body.strip():await telegram("sendMessage",{"chat_id":group_id(),"text":body})
+        if body.strip():await telegram("sendMessage",{"chat_id":recipient,"text":body})
         return
     if len(images)==1:
         with db() as c:r=c.execute("SELECT path FROM media WHERE id=?",(images[0],)).fetchone()
@@ -186,7 +195,7 @@ async def send(body,images):
                 f=p.open("rb");streams.append(f)
                 files["p"+str(i)]=(p.name,f,"image/jpeg" if p.suffix==".jpg" else "image/png" if p.suffix==".png" else "image/webp")
                 album.append({"type":"photo","media":"attach://p"+str(i),**({"caption":body[:1024]} if i==0 else {})})
-            await telegram("sendMediaGroup",{"chat_id":GROUP,"media":json.dumps(album,ensure_ascii=False)},files)
+            await telegram("sendMediaGroup",{"chat_id":recipient,"media":json.dumps(album,ensure_ascii=False)},files)
         finally:
             for f in streams:f.close()
     if len(body)>1024:await telegram("sendMessage",{"chat_id":GROUP,"text":body})
@@ -230,37 +239,78 @@ async def clock():
                         log("실패: "+s["title"]+" "+str(e))
         except Exception as e:log("스케줄 오류 "+str(e))
         await asyncio.sleep(5)
+def member_joined(old,new):
+    old_status=old.get("status","left")
+    new_status=new.get("status","left")
+    def present(m):
+        return m.get("status") in ("member","administrator","creator") or (m.get("status")=="restricted" and m.get("is_member",False))
+    return not present(old) and present(new)
+
+def nickname_for(member):
+    u=member.get("user",member)
+    return (u.get("first_name","")+" "+u.get("last_name","")).strip() or u.get("username") or str(u.get("id","회원"))
+
+async def send_welcome(chat,user):
+    if user.get("is_bot"):return
+    with db() as c:
+        row=c.execute("SELECT value FROM settings WHERE key='welcome'").fetchone()
+        cfg=json.loads(row["value"]) if row else {"active":False}
+    if not cfg.get("active",False):return
+    name=nickname_for(user)
+    body=cfg.get("body","{nickname}님 반갑습니다.").replace("{nickname}",name)
+    await send(body,cfg.get("images",[]),target_chat=str(chat["id"]))
+    log("환영 전송 성공: "+str(chat.get("title",chat["id"]))+" / "+name)
+
+async def handle_update(u):
+    evt=u.get("my_chat_member")
+    if evt:
+        chat=evt.get("chat",{})
+        status=evt.get("new_chat_member",{}).get("status","")
+        if status in ("member","administrator"):track_group(chat)
+        elif status in ("left","kicked"):
+            with db() as c:c.execute("UPDATE groups SET active=0 WHERE chat_id=?",(str(chat.get("id")),))
+    event=u.get("chat_member")
+    if event:
+        chat=event.get("chat",{})
+        if chat.get("type") in ("group","supergroup"):
+            track_group(chat)
+            if member_joined(event.get("old_chat_member",{}),event.get("new_chat_member",{})):
+                try:await send_welcome(chat,event["new_chat_member"].get("user",{}))
+                except Exception as ex:log("환영 전송 실패(chat_member): "+str(ex))
+    msg=u.get("message",{})
+    if msg and msg.get("chat",{}).get("type") in ("group","supergroup"):
+        chat=msg["chat"]
+        track_group(chat)
+        # Telegram may deliver both message and chat_member for one join.
+        # A short-lived dedupe token in SQLite avoids two welcomes for the same member.
+        for member in msg.get("new_chat_members",[]):
+            if member.get("is_bot"):continue
+            try:await send_welcome(chat,member)
+            except Exception as ex:log("환영 전송 실패(new_chat_members): "+str(ex))
+
 async def poll():
     offset=None
     while True:
         try:
             if not TOKEN:
                 await asyncio.sleep(10);continue
-            p={"timeout":25,"allowed_updates":["message","my_chat_member"]}
+            p={"timeout":25,"allowed_updates":["message","my_chat_member","chat_member"]}
             if offset is not None:p["offset"]=offset
-            for u in await telegram("getUpdates",p):
-                offset=u["update_id"]+1
-                evt=u.get("my_chat_member",{})
-                if evt:
-                    chat=evt.get("chat",{})
-                    status=evt.get("new_chat_member",{}).get("status","")
-                    if status in ("member","administrator"):track_group(chat)
-                    elif status in ("left","kicked"):
-                        with db() as c:c.execute("UPDATE groups SET active=0 WHERE chat_id=?",(str(chat.get("id")),))
-                msg=u.get("message",{})
-                if msg.get("chat",{}).get("type") in ("group","supergroup"):track_group(msg["chat"])
-                if str(msg.get("chat",{}).get("id"))!=group_id():continue
-                members=msg.get("new_chat_members",[])
-                if not members:continue
-                with db() as c:cfg=json.loads(c.execute("SELECT value FROM settings WHERE key='welcome'").fetchone()["value"])
-                if not cfg["active"]:continue
-                for m in members:
-                    if m.get("is_bot"):continue
-                    nickname=(m.get("first_name","")+" "+m.get("last_name","")).strip() or str(m["id"])
-                    try:await send(cfg["body"].replace("{nickname}",nickname),cfg["images"])
-                    except Exception as e:log("환영 전송 실패 "+str(e))
-        except Exception as e:
-            log("폴링 오류 "+str(e));await asyncio.sleep(5)
+            updates=await telegram("getUpdates",p)
+            for u in updates:
+                update_id=u["update_id"]
+                offset=update_id+1
+                with db() as c:
+                    result=c.execute("INSERT OR IGNORE INTO processed_updates(update_id) VALUES(?)",(update_id,))
+                if not result.rowcount:continue
+                try:await handle_update(u)
+                except Exception as ex:log("업데이트 처리 실패: "+str(ex))
+            if updates:
+                with db() as c:
+                    c.execute("DELETE FROM processed_updates WHERE update_id < ?",(updates[-1]["update_id"]-20000,))
+        except Exception as ex:
+            log("폴링 오류: "+str(ex))
+            await asyncio.sleep(5)
 @app.on_event("startup")
 async def start():
     initialize()
